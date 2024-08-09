@@ -2640,16 +2640,16 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
       ImGui::SliderInt("CBuffer Index", &shader_cbuffers_index, -1, 13);
       ImGui::PopID();
 
+      ImGui::BeginDisabled(shader_cbuffers_index < 0);
       for (int i = 0; i < MAX_SHADER_CBUFFERS; i += 1) {
         if (cbuffer_titles[i].empty()) {
           cbuffer_titles[i] = "CBuffer " + std::to_string(i);
         }
         ImGui::PushID(cbuffer_titles[i].data());
-        ImGui::BeginDisabled(shader_cbuffers_index < 0);
         ImGui::SliderFloat(cbuffer_titles[i].data(), &shader_cbuffers[i], 0.0, 1.0);
-        ImGui::EndDisabled();
         ImGui::PopID();
       }
+      ImGui::EndDisabled();
 
       ImGui::EndTabItem();
     }
