@@ -50,6 +50,8 @@ struct CachedPipeline {
   std::vector<uint32_t> shader_hashes;
   // If true, this pipeline is currently being "tested"
   bool test = false;
+  // Flag to tell whether this pipeline wants custom cbuffers
+  bool push_cbuffers = false;
 
   bool HasPixelShader() const {
     for (uint32_t i = 0; i < subobject_count; i++) {
@@ -140,6 +142,7 @@ std::vector<uint64_t> trace_pipeline_handles;
 std::vector<InstructionState> instructions;
 
 constexpr uint32_t MAX_SHADER_DEFINES = 10;
+constexpr uint32_t MAX_SHADER_CBUFFERS = 10;
 
 // Settings
 bool auto_dump = true;
@@ -149,7 +152,10 @@ bool trace_list_unique_shaders_only = false;
 bool trace_ignore_vertex_shaders = true;
 static const bool precompile_custom_shaders = true;
 std::vector<std::string> shader_defines;
+std::vector<float> shader_cbuffers;
+int32_t shader_cbuffers_index = -1;
 
+bool last_pressed_unload = false;
 bool trace_scheduled = false;
 bool trace_running = false;
 bool needs_unload_shaders = false;
@@ -290,11 +296,11 @@ void UnloadCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter = 
     // In case this is a full "unload" of all shaders
     if (pipelines_filter.empty())
     {
-      // Disable testing here, otherwise we might not always have a way to do it
-      cached_pipeline->test = false;
-
-      // Clear their compilation state, we might not have any other way of doing it
+      // Clear their compilation state, we might not have any other way of doing it.
+      // Disable testing and cbuffer push here, otherwise we might not always have a way to do it
       if (clean_custom_shader) {
+        cached_pipeline->test = false;
+        cached_pipeline->push_cbuffers = false;
         for (auto shader_hash : cached_pipeline->shader_hashes) {
           ClearCustomShader(shader_hash);
         }
@@ -649,13 +655,13 @@ void CALLBACK HandleEventCallback(DWORD error_code, DWORD bytes_transferred, LPO
 }
 
 void CheckForLiveUpdate() {
-  if (live_reload) {
+  if (live_reload && !last_pressed_unload) {
     WaitForSingleObjectEx(overlapped.hEvent, 0, TRUE);
   }
 }
 
 void ToggleLiveWatching() {
-  if (live_reload) {
+  if (live_reload && !last_pressed_unload) {
     auto directory = GetShaderPath();
     if (!std::filesystem::exists(directory)) {
       std::filesystem::create_directory(directory);
@@ -1136,7 +1142,7 @@ void OnInitPipeline(
 
   // Automatically load any custom shaders that might have been bound to this pipeline.
   // To avoid this slowing down everything, we only do it if we detect the user already had a matching shader in its custom shaders folder.
-  if (auto_load && found_custom_shader_file) {
+  if (auto_load && !last_pressed_unload && found_custom_shader_file) {
     const std::lock_guard<std::recursive_mutex> lock_loading(s_mutex_loading);
     // Immediately cloning and replacing the pipeline might be unsafe, we need to delay it to the next frame.
     pipelines_to_reload.emplace(pipeline.handle);
@@ -1246,6 +1252,34 @@ void OnBindPipeline(
       s << ")";
       reshade::log_message(reshade::log_level::info, s.str().c_str());
     }
+
+#if 1 //TODOFT
+    auto* device = cmd_list->get_device();
+    auto device_api = device->get_api();
+    reshade::api::shader_stage stage = reshade::api::shader_stage::all_graphics;
+    uint32_t param_index = 0;
+    // TODO: figure out the value of "param_index" for DX12
+    if (device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan) {
+      stage = (reshade::api::shader_stage)0;
+      stage |= cached_pipeline->HasComputeShader() ? reshade::api::shader_stage::all_compute : (reshade::api::shader_stage)0;
+      stage |= (cached_pipeline->HasVertexShader() || cached_pipeline->HasPixelShader()) ? reshade::api::shader_stage::all_graphics : (reshade::api::shader_stage)0;
+    } else {
+      stage = (reshade::api::shader_stage)0;
+      stage |= cached_pipeline->HasVertexShader() ? reshade::api::shader_stage::vertex : (reshade::api::shader_stage)0;
+      stage |= cached_pipeline->HasComputeShader() ? reshade::api::shader_stage::compute : (reshade::api::shader_stage)0;
+      stage |= cached_pipeline->HasPixelShader() ? reshade::api::shader_stage::pixel : (reshade::api::shader_stage)0;
+    }
+
+    if (shader_cbuffers_index >= 0 && cached_pipeline->push_cbuffers) {
+      cmd_list->push_constants(
+          stage,                             // Used by reshade to specify graphics or compute
+          reshade::api::pipeline_layout(0),  // cached_pipeline->layout
+          shader_cbuffers_index,             // param_index
+          0,
+          shader_cbuffers.size() * sizeof(float),
+          shader_cbuffers.data());
+    }
+#endif
 
     cmd_list->bind_pipeline(stages, cached_pipeline->pipeline_clone);
   }
@@ -2113,7 +2147,7 @@ void OnReshadePresent(reshade::api::effect_runtime* runtime) {
   }
 
   // Load new shaders (checking the "pipelines_to_reload" count is theoretically not thread safe but it should work nonetheless as this is run every frame)
-  if (auto_load && !thread_auto_loading_running && !pipelines_to_reload.empty()) {
+  if (auto_load && !last_pressed_unload && !thread_auto_loading_running && !pipelines_to_reload.empty()) {
     if (thread_auto_loading.joinable()) {
       thread_auto_loading.join();
     }
@@ -2296,6 +2330,8 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
 
   if (ImGui::Button(std::format("Unload Shaders ({})", cloned_pipeline_count).c_str())) {
     needs_unload_shaders = true;
+    last_pressed_unload = true;
+#if 0  // Not necessary anymore with "last_pressed_unload"
     // For consistency, disable live reload and auto load, it makes no sense for them to be on if we have unloaded shaders
     if (live_reload) {
       live_reload = false;
@@ -2307,12 +2343,14 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
         thread_auto_loading.join();
       }
     }
+#endif
     const std::lock_guard<std::recursive_mutex> lock(s_mutex_loading);
     pipelines_to_reload.clear();
   }
   ImGui::SameLine();
   if (ImGui::Button("Load Shaders")) {
     needs_unload_shaders = false;
+    last_pressed_unload = false;
     needs_load_shaders = true;
     const std::lock_guard<std::recursive_mutex> lock(s_mutex_loading);
     pipelines_to_reload.clear();
@@ -2537,12 +2575,18 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
             const std::lock_guard<std::recursive_mutex> lock(s_mutex_generic);
             if (auto pipeline_pair = pipeline_cache_by_pipeline_handle.find(pipeline_handle); pipeline_pair != pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr) {
               bool test_pipeline = pipeline_pair->second->test;
-              // TODO: skip showing the setting for vertex shaders
+              bool push_cbuffers_pipeline = pipeline_pair->second->push_cbuffers;
               if (ImGui::BeginChild("Settings")) {
-                ImGui::Checkbox("Test Shader (skips drawing, or draws black)", &test_pipeline);
+                ImGui::Checkbox("Custom CBuffers", &push_cbuffers_pipeline);
+                // TODO: disable this for DX12 and other apis that crash with it?
+                if (!pipeline_pair->second->HasVertexShader())
+                {
+                  ImGui::Checkbox("Test Shader (skips drawing, or draws black)", &test_pipeline);
+                }
                 ImGui::EndChild();
               }
               pipeline_pair->second->test = test_pipeline;
+              pipeline_pair->second->push_cbuffers = push_cbuffers_pipeline;
             }
 
             ImGui::EndTabItem();  // Settings
@@ -2589,6 +2633,25 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
       ImGui::EndTabItem();
     }
 
+    if (ImGui::BeginTabItem("Shader CBuffers")) {
+      static std::string cbuffer_titles[MAX_SHADER_CBUFFERS];
+
+      ImGui::PushID("CBuffer Index");
+      ImGui::SliderInt("CBuffer Index", &shader_cbuffers_index, -1, 13);
+      ImGui::PopID();
+
+      for (int i = 0; i < MAX_SHADER_CBUFFERS; i += 1) {
+        if (cbuffer_titles[i].empty()) {
+          cbuffer_titles[i] = "CBuffer " + std::to_string(i);
+        }
+        ImGui::PushID(cbuffer_titles[i].data());
+        ImGui::SliderFloat(cbuffer_titles[i].data(), &shader_cbuffers[i], 0.0, 1.0);
+        ImGui::PopID();
+      }
+
+      ImGui::EndTabItem();
+    }
+
     ImGui::EndTabBar();
   }
 }
@@ -2620,6 +2683,7 @@ void Init() {
 
   // Pre-allocate shader defines and cbuffers
   shader_defines.assign(MAX_SHADER_DEFINES * 2, "");
+  shader_cbuffers.assign(MAX_SHADER_CBUFFERS * 2, 0.0);
 
   // Pre-load all shaders to minimize the wait before replacing them after they are found in game ("auto_load"),
   // and to fill the list of shaders we customized, so we can know which ones we need replace on the spot.
