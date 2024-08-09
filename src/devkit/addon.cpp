@@ -117,8 +117,6 @@ struct __declspec(uuid("3b70b2b2-52dc-4637-bd45-c1171c4c322e")) DeviceData {
   reshade::api::device_api device_api;
 };
 
-std::unordered_set<uint64_t> compute_shader_layouts;
-
 // Pipelines by handle. Multiple pipelines can target the same shader, and even have multiple shaders within themselved
 std::unordered_map<uint64_t, CachedPipeline*> pipeline_cache_by_pipeline_handle;
 // All the pipelines linked to a shader
@@ -671,10 +669,12 @@ void ToggleLiveWatching() {
 
     reshade::log_message(reshade::log_level::info, "Watching live.");
 
+#if 0
     // Clean up any previous handle for safety
     if (m_target_dir_handle != INVALID_HANDLE_VALUE) {
       CancelIoEx(m_target_dir_handle, &overlapped);
     }
+#endif
 
     m_target_dir_handle = CreateFileW(
         directory.c_str(),
@@ -1156,7 +1156,6 @@ void OnDestroyPipeline(
   const std::lock_guard<std::recursive_mutex> lock(s_mutex_generic);
 
   uint32_t changed = 0;
-  changed |= compute_shader_layouts.erase(pipeline.handle);
 
   {
     const std::lock_guard<std::recursive_mutex> lock_loading(s_mutex_loading);
@@ -1252,8 +1251,6 @@ void OnBindPipeline(
   }
 
   if (!trace_running) return;
-
-  // const bool is_compute_shader = compute_shader_layouts.contains(cached_pipeline->layout.handle);
 
   bool add_pipeline_trace = true;
   if (trace_list_unique_shaders_only) {
