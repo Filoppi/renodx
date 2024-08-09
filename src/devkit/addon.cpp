@@ -2645,7 +2645,9 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
           cbuffer_titles[i] = "CBuffer " + std::to_string(i);
         }
         ImGui::PushID(cbuffer_titles[i].data());
+        ImGui::BeginDisabled(shader_cbuffers_index < 0);
         ImGui::SliderFloat(cbuffer_titles[i].data(), &shader_cbuffers[i], 0.0, 1.0);
+        ImGui::EndDisabled();
         ImGui::PopID();
       }
 
