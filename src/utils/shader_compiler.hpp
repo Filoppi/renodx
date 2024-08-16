@@ -111,52 +111,140 @@ inline std::optional<std::string> DisassembleShader(void* code, size_t size) {
   return result;
 }
 
-inline std::vector<uint8_t> CompileShaderFromFileFXC(LPCWSTR file_path, LPCSTR shader_target, const D3D_SHADER_MACRO* defines = nullptr, std::string* out_error = nullptr, LPCWSTR library = L"D3DCompiler_47.dll") {
+void FillDefines(const std::vector<std::string>& in_defines, std::vector<D3D_SHADER_MACRO>& out_defines) {
+  for (int i = 0; i < in_defines.size() && in_defines.size() > 1; i += 2) {
+    if (!in_defines[i].empty() && !in_defines[i + 1].empty()) {
+      out_defines.push_back({in_defines[i].c_str(), in_defines[i + 1].c_str()});
+    }
+  }
+  // It needs to be null terminated
+  if (out_defines.size() > 0) {
+    out_defines.push_back({nullptr, nullptr});
+  }
+}
 
+static std::unordered_map<LPCWSTR, HMODULE> d3d_compiler;
+
+// Returns true if the shader changed (or if we can't compare it)
+inline bool PreprocessShaderFromFile(LPCWSTR file_path, LPCWSTR shader_name_w, LPCSTR shader_target, std::size_t& preprocessed_hash, const std::vector<std::string>& defines = {}, std::string* out_error = nullptr, LPCWSTR fxc_library = L"D3DCompiler_47.dll") {
+  std::vector<D3D_SHADER_MACRO> local_defines;
+  FillDefines(defines, local_defines);
+
+  if (shader_target[3] < '6') {
+    typedef HRESULT(WINAPI * pD3DReadFileToBlob)(LPCWSTR, ID3DBlob**);
+    typedef HRESULT(WINAPI * pD3DPreprocess)(LPCVOID, SIZE_T, LPCSTR, CONST D3D_SHADER_MACRO*, ID3DInclude*, ID3DBlob**, ID3DBlob**);
+    static std::unordered_map<LPCWSTR, pD3DReadFileToBlob> d3d_readFileToBlob;
+    static std::unordered_map<LPCWSTR, pD3DPreprocess> d3d_preprocess;
+    {
+      const std::lock_guard<std::mutex> lock(s_mutex_shader_compiler);
+      if (d3d_compiler[fxc_library] == nullptr) {
+        d3d_compiler[fxc_library] = LoadLibraryW(fxc_library);
+        if (d3d_compiler[fxc_library] != nullptr) {
+          // NOLINTNEXTLINE(google-readability-casting)
+          d3d_readFileToBlob[fxc_library] = pD3DReadFileToBlob(GetProcAddress(d3d_compiler[fxc_library], "D3DReadFileToBlob"));
+          d3d_preprocess[fxc_library] = pD3DPreprocess(GetProcAddress(d3d_compiler[fxc_library], "D3DPreprocess"));
+        }
+      }
+    }
+
+    if (d3d_readFileToBlob[fxc_library] != nullptr && d3d_preprocess[fxc_library] != nullptr) {
+      CComPtr<ID3DBlob> uncompiled_blob;
+      if (SUCCEEDED(d3d_readFileToBlob[fxc_library](
+              file_path,
+              &uncompiled_blob))) {
+#pragma warning(push)
+#pragma warning(disable : 4244)
+        const std::wstring& shader_name_w_s = shader_name_w;
+        std::string shader_name_s(shader_name_w_s.length(), ' ');
+        std::copy(shader_name_w_s.begin(), shader_name_w_s.end(), shader_name_s.begin());  
+        LPCSTR shader_name = shader_name_s.c_str();
+#pragma warning(pop) 
+        CComPtr<ID3DBlob> preprocessed_blob;
+        CComPtr<ID3DBlob> error_blob;
+        HRESULT result = d3d_preprocess[fxc_library](
+            uncompiled_blob->GetBufferPointer(),
+            uncompiled_blob->GetBufferSize(),
+            shader_name,
+            local_defines.data(),
+            D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            &preprocessed_blob,
+            &error_blob);
+        if (FAILED(result) && out_error != nullptr && error_blob != nullptr) {
+          out_error->assign(reinterpret_cast<char*>(error_blob->GetBufferPointer()));
+        }
+        if (SUCCEEDED(result) && preprocessed_blob != nullptr) {
+          std::string prepocessed_blob_string;  // TODO: there's probably a more optimize way of finding the blob's hash
+          prepocessed_blob_string.assign(reinterpret_cast<char*>(preprocessed_blob->GetBufferPointer()));
+          std::size_t new_preprocessed_hash = std::hash<std::string>{}(prepocessed_blob_string);
+          if (preprocessed_hash == new_preprocessed_hash) {
+            return false;
+          }
+          preprocessed_hash = new_preprocessed_hash;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+inline std::vector<uint8_t> CompileShaderFromFileFXC(LPCWSTR file_path, LPCSTR shader_target, const D3D_SHADER_MACRO* defines = nullptr, std::string* out_error = nullptr, LPCWSTR library = L"D3DCompiler_47.dll") {
   typedef HRESULT(WINAPI * pD3DCompileFromFile)(LPCWSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+  typedef HRESULT(WINAPI * pD3DWriteBlobToFile)(ID3DBlob*, LPCWSTR, BOOL);
   static std::unordered_map<LPCWSTR, pD3DCompileFromFile> d3d_compilefromfile;
+  static std::unordered_map<LPCWSTR, pD3DWriteBlobToFile> d3d_writeBlobToFile;
   {
     const std::lock_guard<std::mutex> lock(s_mutex_shader_compiler);
-    static std::unordered_map<LPCWSTR, HMODULE> d3d_compiler;
-    d3d_compiler[library] = LoadLibraryW(library);
-    if (d3d_compiler[library] != nullptr) {
-      // NOLINTNEXTLINE(google-readability-casting)
-      d3d_compilefromfile[library] = pD3DCompileFromFile(GetProcAddress(d3d_compiler[library], "D3DCompileFromFile"));
+    if (d3d_compiler[library] == nullptr)
+    {
+      d3d_compiler[library] = LoadLibraryW(library);
+      if (d3d_compiler[library] != nullptr) {
+        // NOLINTNEXTLINE(google-readability-casting)
+        d3d_compilefromfile[library] = pD3DCompileFromFile(GetProcAddress(d3d_compiler[library], "D3DCompileFromFile"));
+        d3d_writeBlobToFile[library] = pD3DWriteBlobToFile(GetProcAddress(d3d_compiler[library], "D3DWriteBlobToFile"));  // TODOFT
+      }
     }
   }
 
-  std::vector<uint8_t> result;
+  std::vector<uint8_t> compiled_shader;
   CComPtr<ID3DBlob> out_blob;
   if (d3d_compilefromfile[library] != nullptr) {
     CComPtr<ID3DBlob> error_blob;
-    if (SUCCEEDED(d3d_compilefromfile[library](
-            file_path,
-            defines,
-            D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            "main",
-            shader_target,
-            D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY,
-            0,
-            &out_blob,
-            &error_blob))) {
-      result.assign(
+    HRESULT result = d3d_compilefromfile[library](
+        file_path,
+        defines,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "main",
+        shader_target,
+        D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY,
+        0,
+        &out_blob,
+        &error_blob);
+    if (SUCCEEDED(result)) {
+      compiled_shader.assign(
           reinterpret_cast<uint8_t*>(out_blob->GetBufferPointer()),
           reinterpret_cast<uint8_t*>(out_blob->GetBufferPointer()) + out_blob->GetBufferSize());
-    } else {
+    }
+    bool failed = FAILED(result);
+    bool error = failed || error_blob != nullptr;
+    if (error) {
       std::stringstream s;
+      if (failed) {
       s << "CompileShaderFromFileFXC(Compilation failed";
+      }
+      else {
+        s << "CompileShaderFromFileFXC(Compilation warning";
+      }
       if (error_blob != nullptr) {
-        // auto error_size = error_blob->GetBufferSize();
         auto* error = reinterpret_cast<uint8_t*>(error_blob->GetBufferPointer());
         s << ": " << error;
-        if (out_error != nullptr) {
+        if (error && out_error != nullptr) {
           out_error->assign((char*)error);
         }
       } else {
         s << ".";
       }
       s << ")";
-      reshade::log_message(reshade::log_level::error, s.str().c_str());
+      reshade::log_message(failed ? reshade::log_level::error : reshade::log_level::warning, s.str().c_str());
     }
   }
 
@@ -164,7 +252,7 @@ inline std::vector<uint8_t> CompileShaderFromFileFXC(LPCWSTR file_path, LPCSTR s
   FreeLibrary(d3d_compiler[library]);
 #endif
 
-  return result;
+  return compiled_shader;
 }
 
 #define IFR(x)                \
@@ -371,14 +459,7 @@ inline std::vector<uint8_t> CompileShaderFromFileDXC(LPCWSTR file_path, LPCSTR s
 
 inline std::vector<uint8_t> CompileShaderFromFile(LPCWSTR file_path, LPCSTR shader_target, const std::vector<std::string>& defines = {}, std::string* out_error = nullptr, LPCWSTR fxc_library = L"D3DCompiler_47.dll") {
   std::vector<D3D_SHADER_MACRO> local_defines;
-  for (int i = 0; i < defines.size() && defines.size() > 1; i += 2) {
-    if (!defines[i].empty() && !defines[i + 1].empty()) {
-      local_defines.push_back({defines[i].c_str(), defines[i+1].c_str()});
-    }
-  }
-  if (local_defines.size() > 0) {
-    local_defines.push_back({nullptr, nullptr});
-  }
+  FillDefines(defines, local_defines);
 
   if (shader_target[3] < '6') {
     return CompileShaderFromFileFXC(file_path, shader_target, local_defines.data(), out_error, fxc_library);

@@ -93,6 +93,7 @@ struct CachedCustomShader {
   std::vector<uint8_t> code;
   bool is_hlsl = false;
   std::filesystem::path file_path;
+  std::size_t preprocessed_hash = 0;
   std::string compilation_error;
 };
 
@@ -282,6 +283,7 @@ void ClearCustomShader(uint32_t shader_hash) {
   if (custom_shader != custom_shaders_cache.end() && custom_shader->second != nullptr) {
     custom_shader->second->code.clear();
     custom_shader->second->is_hlsl = false;
+    custom_shader->second->preprocessed_hash = 0;
     custom_shader->second->file_path.clear();
     custom_shader->second->compilation_error.clear();
   }
@@ -333,6 +335,12 @@ void CompileCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter =
     std::filesystem::create_directory(directory);
     return;
   }
+
+  auto previous_path = std::filesystem::current_path();
+  // Set the current path to the shaders directory, it's needed by the DX compilers (specifically by the preprocess functions)
+  std::filesystem::current_path(directory);
+
+  const auto shader_defines_copy = shader_defines;  // This is not 100% thread safe but it shouldn't matter
 
   for (const auto& entry : std::filesystem::directory_iterator(directory)) {
     if (!entry.is_regular_file()) {
@@ -402,13 +410,25 @@ void CompileCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter =
     }
 
     const std::lock_guard<std::recursive_mutex> lock(s_mutex_loading);
-    const bool has_custom_shader = custom_shaders_cache.find(shader_hash) != custom_shaders_cache.end();
     auto& custom_shader = custom_shaders_cache[shader_hash];
-    if (!has_custom_shader || custom_shader == nullptr) {
+    const bool has_custom_shader = (custom_shaders_cache.find(shader_hash) != custom_shaders_cache.end()) && (custom_shader != nullptr);
+    if (!has_custom_shader) {
       custom_shader = new CachedCustomShader();
     }
-    else {
+
+    // TODO: keep the preprocessed blob produced from this and feed it to the compiler, otherwise it will do the preprocess step twice
+    // Skip compiling the shader if it didn't change
+    if (!renodx::utils::shader::compiler::PreprocessShaderFromFile(entry_path.c_str(), entry_path.filename().c_str(), shader_target.c_str(), custom_shader->preprocessed_hash, shader_defines_copy, &custom_shader->compilation_error)) {
+      continue;
+    }
+
+    if (has_custom_shader) {
+      auto preprocessed_hash = custom_shader->preprocessed_hash;
+      auto compilation_error = custom_shader->compilation_error;
       ClearCustomShader(shader_hash);
+      // Keep the data we just filled up
+      custom_shader->preprocessed_hash = preprocessed_hash;
+      custom_shader->compilation_error = compilation_error;
     }
     custom_shader->file_path = entry_path;
     custom_shader->is_hlsl = is_hlsl;
@@ -428,7 +448,7 @@ void CompileCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter =
       custom_shader->code = renodx::utils::shader::compiler::CompileShaderFromFile(
           entry_path.c_str(),
           shader_target.c_str(),
-          shader_defines,
+          shader_defines_copy,
           &custom_shader->compilation_error);
       if (custom_shader->code.empty()) {
         std::stringstream s;
@@ -462,6 +482,9 @@ void CompileCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter =
       }
     }
   }
+
+  // Restore it to avoid unknown consequences
+  std::filesystem::current_path(previous_path);
 }
 
 void LoadCustomShaders(const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>(), bool recompile_shaders = true, bool immediate_load = true, bool immediate_unload = false) {
@@ -1276,7 +1299,7 @@ void OnBindPipeline(
           reshade::api::pipeline_layout(0),  // cached_pipeline->layout
           shader_cbuffers_index,             // param_index
           0,
-          shader_cbuffers.size() * sizeof(float),
+          shader_cbuffers.size() * sizeof(float), // This is not 100% thread safe but it shouldn't matter
           shader_cbuffers.data());
     }
 #endif
@@ -2634,7 +2657,6 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
     }
 
     if (ImGui::BeginTabItem("Shader CBuffers")) {
-      static std::string cbuffer_titles[MAX_SHADER_CBUFFERS];
 
       ImGui::PushID("CBuffer Index");
       ImGui::SliderInt("CBuffer Index", &shader_cbuffers_index, -1, 13);
@@ -2696,7 +2718,7 @@ void Init() {
     thread_auto_loading_running = true;
     static std::binary_semaphore async_shader_compilation_semaphore{0};
     thread_auto_loading = std::thread([] {
-      //  We need to lock this mutex for the whole async shader loading, so that if the game starts loading shaders, we can already see if we have a custom version and live load it ("live_load"), otherwise the "custom_shaders_cache" list would be incomplete
+      // We need to lock this mutex for the whole async shader loading, so that if the game starts loading shaders, we can already see if we have a custom version and live load it ("live_load"), otherwise the "custom_shaders_cache" list would be incomplete
       const std::lock_guard<std::recursive_mutex> lock(s_mutex_loading);
       // This is needed to make sure this thread locks "s_mutex_loading" before any other function could
       async_shader_compilation_semaphore.release();
